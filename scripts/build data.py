@@ -10,6 +10,13 @@
   DART_API_KEY    : DART 인증키
   DATA_GO_KR_KEY  : 공공데이터포털 '일반 인증키(Decoding)'
   MIN_CAP_EOK     : 대상 시가총액 하한(억원, 기본 2000)
+  FULL_REFRESH    : true 이면 캐시를 무시하고 전부 새로 받음
+
+캐시(cache.json)
+  - 지난 달들의 월말 시세는 한 번 받으면 재사용
+  - DART 배당·재무·EPS·배당주기·업종은 회사별로 30일마다 나눠서 갱신
+  - 결산 기준 연도가 바뀌면(매년 4월) DART 캐시 전체를 새로 받음
+  - 오류로 못 받은 값은 저장하지 않음
 """
 import io
 import os
@@ -27,6 +34,9 @@ PRICE_KEY = os.environ.get("DATA_GO_KR_KEY", "")
 MIN_CAP_EOK = float(os.environ.get("MIN_CAP_EOK", "2000"))
 MIN_CAP_PREF_EOK = float(os.environ.get("MIN_CAP_PREF_EOK", "1000"))  # 우선주 시총 하한
 MONTHS = 60  # 배당률 비교용 월말 주가 기간(5년)
+CACHE_FILE = "cache.json"
+FULL_REFRESH = os.environ.get("FULL_REFRESH", "").lower() in ("1", "true", "yes")
+REFRESH_DAYS = 30  # DART 자료는 회사별로 30일에 한 번씩 나눠서 새로 받음
 
 DART = "https://opendart.fss.or.kr/api"
 PRICE_BASE = "https://apis.data.go.kr/1160100/"
@@ -201,14 +211,19 @@ KSIC = {
 }
 
 
-def sector_of(corp):
+def induty_code(corp):
     j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": corp})
     time.sleep(0.06)
-    code = (j.get("induty_code") or "").strip()
+    if j.get("status") != "000":
+        raise ApiError(f"company.json {j.get('status')} {j.get('message')}")
+    return (j.get("induty_code") or "").strip()
+
+
+def sector_name(code):
     for n in range(len(code), 1, -1):
         if code[:n] in KSIC:
-            return KSIC[code[:n]], code
-    return "기타", code
+            return KSIC[code[:n]]
+    return "기타"
 
 
 def interim_dps(corp, year, reprt):
@@ -292,6 +307,50 @@ def acct(fs, prefix):
         if k.startswith(prefix):
             return v
     return [None, None, None]
+
+
+# ───────────────────────── 캐시 ─────────────────────────
+def load_cache():
+    empty = {"v": 1, "fy": LATEST_FY, "prices": {}, "corp": {}}
+    if FULL_REFRESH:
+        log("전체 새로 받기 모드 → 캐시 무시")
+        return empty
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        log("캐시 없음 → 처음부터 수집")
+        return empty
+    if c.get("v") != 1:
+        return empty
+    if c.get("fy") != LATEST_FY:
+        log(f"결산 기준 연도 변경 {c.get('fy')} → {LATEST_FY}: DART 캐시 초기화")
+        c["corp"], c["fy"] = {}, LATEST_FY
+    return c
+
+
+def save_cache(c):
+    tmp = CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(c, f, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    os.replace(tmp, CACHE_FILE)
+
+
+def due_today(corp, entry):
+    """오늘 새로 받을 차례인지: 회사코드로 30개 그룹을 나눠 하루 한 그룹씩, 35일 넘은 건 무조건"""
+    if not entry:
+        return True
+    try:
+        age = (TODAY - dt.date.fromisoformat(entry.get("t", "2000-01-01"))).days
+    except ValueError:
+        return True
+    if age > REFRESH_DAYS + 5:
+        return True
+    return age >= 1 and int(corp) % REFRESH_DAYS == TODAY.toordinal() % REFRESH_DAYS
+
+
+def intkeys(d):
+    return {int(k): v for k, v in (d or {}).items()}
 
 
 # ───────────────────────── 분석 ─────────────────────────
@@ -502,46 +561,71 @@ def main():
         uni[code], base_of[code] = r, base
     log("분석 대상", len(uni))
 
-    hist = {c: [] for c in uni}
-    for me in month_ends(MONTHS):
-        d, snap = snapshot_on_or_before(me)
-        if not snap:
-            continue
-        for c in uni:
-            r = snap.get(c)
-            if r:
-                hist[c].append((d.strftime("%Y%m"), num(r.get("clpr")), num(r.get("lstgStCnt"))))
-    log("월말 주가 수집 완료")
+    cache = load_cache()
 
+    # ── 월말 주가: 캐시에 있는 달은 재사용 ──
+    hist = {c: [] for c in uni}
+    new_months = 0
+    for me in month_ends(MONTHS):
+        key = me.strftime("%Y%m")
+        ent = cache["prices"].get(key)
+        if not ent:
+            d, snap = snapshot_on_or_before(me)
+            if not snap:
+                continue
+            ent = {"d": d.isoformat(), "r": {c: [num(r.get("clpr")), num(r.get("lstgStCnt"))]
+                                                for c, r in snap.items()
+                                                if r.get("mrktCtg") in ("KOSPI", "KOSDAQ")}}
+            cache["prices"][key] = ent
+            new_months += 1
+        for c in uni:
+            v = ent["r"].get(c)
+            if v:
+                hist[c].append((ent["d"][:4] + ent["d"][5:7], v[0], v[1]))
+    keep = {me.strftime("%Y%m") for me in month_ends(MONTHS)}
+    cache["prices"] = {k: v for k, v in cache["prices"].items() if k in keep}
+    log(f"월말 주가 준비 완료 (새로 받은 달 {new_months}개)")
+
+    # ── DART: 회사별 캐시, 오늘 차례인 회사만 새로 받음 ──
     corps = sorted({cmap[base_of[c]] for c in uni})
-    divs = {}
-    for i, corp in enumerate(corps, 1):
+    cc = cache["corp"]
+    todo = [k for k in corps if due_today(k, cc.get(k))]
+    log(f"DART 대상 회사 {len(corps)} · 오늘 새로 받을 회사 {len(todo)}")
+    try:
+        fresh_fins, fins_ok = (financials(todo, LATEST_FY) if todo else {}), True
+    except Exception as e:  # noqa: BLE001
+        log("  재무 일괄조회 실패 → 배당 지급 회사는 다음 실행 때 다시 받음", e)
+        fresh_fins, fins_ok = {}, False
+    for i, corp in enumerate(todo, 1):
         try:
-            divs[corp] = dividends(corp)
+            dby, payout = dividends(corp)
+            ent = {"t": TODAY.isoformat(), "div": dby, "pay": payout}
+            if (dby["보통"].get(LATEST_FY) or 0) > 0 or (dby["우선"].get(LATEST_FY) or 0) > 0:
+                if not fins_ok:
+                    raise ApiError("재무 자료 없음")
+                ent["cyc"] = pay_cycle(corp)
+                ent["ps"] = list(per_share(corp, LATEST_FY))
+                ent["ind"] = induty_code(corp)
+                ent["fs"] = fresh_fins.get(corp, {})
+            cc[corp] = ent  # 전부 성공했을 때만 저장
         except Exception as e:  # noqa: BLE001
-            log("  배당 실패", corp, e)
+            log("  DART 실패(다음 실행 때 재시도)", corp, e)
         if i % 100 == 0:
-            log(f"  배당 {i}/{len(corps)}")
+            log(f"  DART {i}/{len(todo)}")
+            save_cache(cache)  # 중간 저장
+    save_cache(cache)
+
+    def ent_of(c):
+        return cc.get(cmap[base_of[c]])
 
     def dps_of(c):
-        d = divs.get(cmap[base_of[c]])
-        if not d:
+        e = ent_of(c)
+        if not e:
             return None
-        return d[0]["우선" if base_of[c] != c else "보통"]
+        return intkeys(e["div"]["우선" if base_of[c] != c else "보통"])
 
-    payers = [c for c in uni if (dps_of(c) or {}).get(LATEST_FY, 0) > 0]
-    pay_corps = sorted({cmap[base_of[c]] for c in payers})
-    fins = financials(pay_corps, LATEST_FY)
-    log("배당 지급 종목", len(payers), "회사", len(pay_corps))
-
-    extra = {}
-    for i, corp in enumerate(pay_corps, 1):
-        try:
-            extra[corp] = (pay_cycle(corp), per_share(corp, LATEST_FY), sector_of(corp))
-        except Exception as e:  # noqa: BLE001
-            log("  주기·EPS·섹터 실패", corp, e)
-        if i % 100 == 0:
-            log(f"  주기·EPS·섹터 {i}/{len(pay_corps)}")
+    payers = [c for c in uni if (dps_of(c) or {}).get(LATEST_FY, 0) > 0 and "cyc" in ent_of(c)]
+    log("배당 지급 종목", len(payers))
 
     # 보통주+우선주 합산 상장주식수 (BPS 계산용)
     tot_shares = {}
@@ -552,14 +636,14 @@ def main():
 
     out = []
     for c in payers:
-        corp = cmap[base_of[c]]
-        payout = divs[corp][1]
-        cyc, ps, sec = extra.get(corp, (1, (None, None), ("기타", "")))
+        e = ent_of(c)
         common_shares = num((cur.get(base_of[c]) or {}).get("lstgStCnt"))
-        a = analyze(c, uni[c], hist[c], dps_of(c), payout, fins.get(corp, {}), cyc, ps,
+        a = analyze(c, uni[c], hist[c], dps_of(c), intkeys(e["pay"]), e.get("fs", {}),
+                    e.get("cyc", 1), tuple(e.get("ps") or (None, None)),
                     common_shares, tot_shares.get(base_of[c]))
         if a:
-            a["sec"], a["ksic"] = sec
+            a["ksic"] = e.get("ind", "")
+            a["sec"] = sector_name(a["ksic"])
             a["pref"] = base_of[c] != c
             out.append(a)
     out.sort(key=lambda x: -x["s"])
