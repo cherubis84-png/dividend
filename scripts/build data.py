@@ -42,20 +42,31 @@ def log(*a):
     print(*a, flush=True)
 
 
+class ApiError(Exception):
+    pass
+
+
 def get_json(url, params, tries=4):
     last_err = None
     for i in range(tries):
         try:
             r = S.get(url, params=params, timeout=40)
-            r.raise_for_status()
-            try:
-                return r.json()
-            except ValueError:
-                raise RuntimeError("JSON 아님(키 오류 가능): " + r.text[:200])
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001  (네트워크 오류만 재시도)
             last_err = e
             log("  재시도", url.rsplit("/", 1)[-1], e)
             time.sleep(3 * (i + 1))
+            continue
+        if r.status_code == 429 or r.status_code >= 500:
+            last_err = ApiError(f"HTTP {r.status_code}: {r.text[:300]}")
+            log("  재시도", url.rsplit("/", 1)[-1], last_err)
+            time.sleep(3 * (i + 1))
+            continue
+        if r.status_code != 200:
+            raise ApiError(f"HTTP {r.status_code} ({url.rsplit('/', 1)[-1]}) 서버 응답: {r.text[:500]}")
+        try:
+            return r.json()
+        except ValueError:
+            raise ApiError("JSON 이 아닌 응답(인증키 오류 가능): " + r.text[:500])
     raise last_err
 
 
@@ -78,7 +89,10 @@ def price_snapshot(day):
     while True:
         j = get_json(PRICE_URL, {
             "serviceKey": PRICE_KEY, "resultType": "json",
-            "basDt": day.strftime("%Y%m%d"), "numOfRows": 4000, "pageNo": page})
+            "basDt": day.strftime("%Y%m%d"), "numOfRows": 1000, "pageNo": page})
+        head = j.get("response", {}).get("header", {})
+        if head and head.get("resultCode") not in (None, "00"):
+            raise ApiError(f"시세 API 오류 {head.get('resultCode')}: {head.get('resultMsg')}")
         body = j.get("response", {}).get("body", {})
         items = body.get("items") or {}
         it = items.get("item", []) if isinstance(items, dict) else []
@@ -370,6 +384,18 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None)):
 def main():
     if not DART_KEY or not PRICE_KEY:
         raise SystemExit("DART_API_KEY / DATA_GO_KR_KEY 를 Secrets 에 등록하세요.")
+
+    # 시세 API 키 점검 (1건만 요청해 서버 응답을 그대로 보여줌)
+    try:
+        j = get_json(PRICE_URL, {"serviceKey": PRICE_KEY, "resultType": "json",
+                                 "numOfRows": 1, "pageNo": 1})
+        log("시세 API 점검 OK:", json.dumps(j.get("response", {}).get("header", {}), ensure_ascii=False))
+    except ApiError as e:
+        raise SystemExit("시세 API(공공데이터포털) 호출 실패 → " + str(e))
+    j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": "00126380"})
+    if j.get("status") != "000":
+        raise SystemExit(f"DART 인증키 오류 → {j.get('status')} {j.get('message')}")
+    log("DART 점검 OK")
 
     cur_day, cur = snapshot_on_or_before(TODAY)
     if not cur:
