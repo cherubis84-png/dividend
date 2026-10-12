@@ -308,9 +308,35 @@ def clamp(x, lo=0.0, hi=1.0):
 def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
             common_shares=None, total_shares=None):
     price = num(row.get("clpr"))
-    last = dps.get(LATEST_FY)
-    if not price or not last or last <= 0:
+    if not price or not (dps.get(LATEST_FY) or 0) > 0:
         return None
+
+    # ── 주식분할·병합 보정: 상장주식수가 한 달에 1.5배 이상 변하면 분할/병합으로 보고
+    #    과거 주가·배당금을 현재 주식수 기준으로 환산
+    cur_sh = num(row.get("lstgStCnt"))
+    seq = [(ym, p, sh) for ym, p, sh in hist] + [("now", price, cur_sh)]
+    mult = [1.0] * len(seq)
+    split_events = []
+    for i in range(len(seq) - 2, -1, -1):
+        a, b = seq[i][2], seq[i + 1][2]
+        r = b / a if a and b else 1.0
+        jump = r > 1.5 or r < 0.67
+        if jump:
+            split_events.append(seq[i + 1][0])
+        mult[i] = mult[i + 1] * (r if jump else 1.0)
+    split = bool(split_events)
+    hist = [(ym, (p / mult[i]) if p else p, sh) for i, (ym, p, sh) in enumerate(seq[:-1])]
+    if split:
+        idx = {ym: i for i, (ym, _, _) in enumerate(seq[:-1])}
+
+        def mult_for_year(y):  # 결산(12월) 시점의 환산 배수
+            i = idx.get(f"{y}12")
+            if i is None:
+                i = 0 if f"{y}12" < seq[0][0] else len(seq) - 1
+            return mult[i]
+        dps = {y: v / mult_for_year(y) for y, v in dps.items()}
+
+    last = dps[LATEST_FY]
 
     # 배당 지급 기간(연속 지급 연수) — 조회 가능한 기간 끝까지 이어지면 '+' 표시
     paid, y = 0, LATEST_FY
@@ -342,15 +368,19 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
     vals = [v for _, v in yh]
     avg5 = statistics.mean(vals) if len(vals) >= 24 else None
     ratio = cur_y / avg5 if avg5 else None
+    # 배당 급증(특별배당 등) 의심: 직전 3년 평균의 1.8배 초과
+    prior = [dps[y] for y in (LATEST_FY - 1, LATEST_FY - 2, LATEST_FY - 3) if y in dps]
+    prior_avg = statistics.mean(prior) if prior else 0
+    jump = prior_avg > 0 and last > prior_avg * 1.8
+    # 할인 점수용 배당률은 급증분을 직전 3년 평균의 1.5배로 눌러서 계산 → '주가가 싸진 정도'를 반영
+    d_disc = min(last, prior_avg * 1.5) if jump else last
+    ratio_disc = (d_disc / price * 100) / avg5 if avg5 else None
     pct = (sum(1 for v in vals if v < cur_y) / len(vals) * 100) if vals else None
 
     prices = [p for _, p, _ in hist if p] + [price]
     dd52 = price / max(prices[-13:]) - 1
     dd5y = price / max(prices) - 1
 
-    # 주식분할·병합 의심(상장주식수 급변) → 배당·주가 왜곡 경고
-    shares = [s for _, _, s in hist if s] + [num(row.get("lstgStCnt")) or 0]
-    split = any(b and a and (b / a > 1.5 or b / a < 0.67) for a, b in zip(shares, shares[1:]))
 
     # 재무 안정성
     debt, eq = acct(fs, "부채총계")[0], acct(fs, "자본총계")[0]
@@ -398,7 +428,7 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
     if pay is not None:
         grow += 10 if 20 <= pay <= 60 else 7 if 0 < pay < 20 else 5 if pay <= 80 else 0
 
-    disc = clamp(((ratio or 1) - 1) / 0.5) * 20 + clamp(-dd52 / 0.4) * 10
+    disc = clamp(((ratio_disc or 1) - 1) / 0.5) * 20 + clamp(-dd52 / 0.4) * 10
 
     return {
         "c": code, "n": row.get("itmsNm"), "m": row.get("mrktCtg"),
@@ -413,7 +443,7 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
         "debt": round(debt_ratio) if debt_ratio is not None else None,
         "curr": round(cur_ratio) if cur_ratio is not None else None,
         "fin": is_fin, "op": op_pos, "opn": len(op), "ni": ni_pos, "nin": len(ni),
-        "split": split,
+        "split": split, "jump": jump,
         "paid": paid, "paidp": paid_plus, "cyc": cyc,
         "g1": round(g1 * 100, 1) if g1 is not None else None,
         "eps": round(eps) if eps is not None else None,
