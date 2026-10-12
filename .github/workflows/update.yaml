@@ -2,8 +2,13 @@ name: update-data
 
 on:
   schedule:
-    - cron: "17 6 * * 1-5"   # 한국시간 평일 15:17 (전 영업일 시세 반영 후)
+    - cron: "17 6 * * 1-5"   # 한국시간 평일 15:17
   workflow_dispatch:          # Actions 탭에서 수동 실행
+    inputs:
+      full:
+        description: "전체 새로 받기 (캐시 무시, 약 30분)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -19,15 +24,16 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - run: python "$(ls scripts/*.py | head -n1)"
-
         env:
           DART_API_KEY: ${{ secrets.DART_API_KEY }}
           DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
           MIN_CAP_EOK: "2000"
+          FULL_REFRESH: ${{ inputs.full }}
       - name: commit
+        if: always()
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add data.json
+          for f in data.json cache.json; do [ -f "$f" ] && git add "$f"; done
           git commit -m "data $(date -u +%F)" || echo "no changes"
           git push
