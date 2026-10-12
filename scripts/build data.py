@@ -28,8 +28,14 @@ MIN_CAP_EOK = float(os.environ.get("MIN_CAP_EOK", "2000"))
 MONTHS = 60  # 배당률 비교용 월말 주가 기간(5년)
 
 DART = "https://opendart.fss.or.kr/api"
-PRICE_URL = ("https://apis.data.go.kr/1160100/"
-             "GetStockSecuritiesInfoService_V2/getStockPriceInfo")
+PRICE_BASE = "https://apis.data.go.kr/1160100/"
+PRICE_CANDIDATES = [  # 포털 버전에 따라 주소가 다름 → 응답하는 것을 사용
+    "GetStockSecuritiesInfoService_V2/getStockPriceInfo_V2",
+    "GetStockSecuritiesInfoService_V2/getStockPriceInfo",
+    "GetStockSecuritiesInfoService/getStockPriceInfo",
+    "service/GetStockSecuritiesInfoService/getStockPriceInfo",
+]
+PRICE_URL = PRICE_BASE + PRICE_CANDIDATES[0]
 
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0 (dividend-scanner)"
@@ -385,13 +391,26 @@ def main():
     if not DART_KEY or not PRICE_KEY:
         raise SystemExit("DART_API_KEY / DATA_GO_KR_KEY 를 Secrets 에 등록하세요.")
 
-    # 시세 API 키 점검 (1건만 요청해 서버 응답을 그대로 보여줌)
-    try:
-        j = get_json(PRICE_URL, {"serviceKey": PRICE_KEY, "resultType": "json",
-                                 "numOfRows": 1, "pageNo": 1})
-        log("시세 API 점검 OK:", json.dumps(j.get("response", {}).get("header", {}), ensure_ascii=False))
-    except ApiError as e:
-        raise SystemExit("시세 API(공공데이터포털) 호출 실패 → " + str(e))
+    # 시세 API 주소·키 점검 (1건만 요청)
+    global PRICE_URL
+    errs = []
+    for cand in PRICE_CANDIDATES:
+        try:
+            j = get_json(PRICE_BASE + cand, {"serviceKey": PRICE_KEY, "resultType": "json",
+                                             "numOfRows": 1, "pageNo": 1})
+            head = j.get("response", {}).get("header", {})
+            if head.get("resultCode") not in (None, "00"):
+                raise ApiError(f"{head.get('resultCode')} {head.get('resultMsg')}")
+            PRICE_URL = PRICE_BASE + cand
+            log("시세 API 점검 OK:", cand, json.dumps(head, ensure_ascii=False))
+            items = (j.get("response", {}).get("body", {}).get("items") or {}).get("item")
+            if items:
+                log("  응답 항목:", ", ".join((items[0] if isinstance(items, list) else items).keys()))
+            break
+        except ApiError as e:
+            errs.append(f"{cand} → {e}")
+    else:
+        raise SystemExit("시세 API(공공데이터포털) 호출 실패\n" + "\n".join(errs))
     j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": "00126380"})
     if j.get("status") != "000":
         raise SystemExit(f"DART 인증키 오류 → {j.get('status')} {j.get('message')}")
