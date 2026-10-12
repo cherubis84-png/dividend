@@ -37,6 +37,9 @@ MONTHS = 60  # 배당률 비교용 월말 주가 기간(5년)
 CACHE_FILE = "cache.json"
 FULL_REFRESH = os.environ.get("FULL_REFRESH", "").lower() in ("1", "true", "yes")
 REFRESH_DAYS = 30  # DART 자료는 회사별로 30일에 한 번씩 나눠서 새로 받음
+DART_MINUTES = float(os.environ.get("DART_MINUTES", "45"))  # 한 번 실행에서 DART 수집에 쓸 최대 시간
+DART_MAX_CALLS = int(os.environ.get("DART_MAX_CALLS", "15000"))  # 일일 한도 2만 건 중 이번 실행 상한
+START = time.time()
 
 DART = "https://opendart.fss.or.kr/api"
 PRICE_BASE = "https://apis.data.go.kr/1160100/"
@@ -146,6 +149,30 @@ def month_ends(n):
 
 
 # ───────────────────────── DART ─────────────────────────
+class DartLimit(Exception):
+    """DART 일일 호출 한도(2만 건) 초과"""
+
+
+DART_CALLS = 0
+
+
+def dart(endpoint, params, pause=0.06):
+    """DART 호출. 정상 → JSON, 자료 없음(013·014) → None, 한도 초과 → DartLimit, 그 외 → ApiError
+    (오류를 '자료 없음'으로 착각해 캐시에 저장하는 일을 막기 위함)"""
+    global DART_CALLS
+    DART_CALLS += 1
+    j = get_json(f"{DART}/{endpoint}", {"crtfc_key": DART_KEY, **params})
+    time.sleep(pause)
+    st = j.get("status")
+    if st == "000":
+        return j
+    if st in ("013", "014"):
+        return None
+    if st == "020":
+        raise DartLimit(j.get("message"))
+    raise ApiError(f"{endpoint} {st} {j.get('message')}")
+
+
 def corp_codes():
     r = S.get(f"{DART}/corpCode.xml", params={"crtfc_key": DART_KEY}, timeout=90)
     r.raise_for_status()
@@ -164,11 +191,8 @@ def dividends(corp):
     — 사업보고서 3년치 × 4회 = 12년"""
     dps_by, pay_c, pay_s = {"보통": {}, "우선": {}}, {}, {}
     for y in (LATEST_FY, LATEST_FY - 3, LATEST_FY - 6, LATEST_FY - 9):
-        j = get_json(f"{DART}/alotMatter.json", {
-            "crtfc_key": DART_KEY, "corp_code": corp,
-            "bsns_year": str(y), "reprt_code": "11011"})
-        time.sleep(0.06)
-        if j.get("status") != "000":
+        j = dart("alotMatter.json", {"corp_code": corp, "bsns_year": str(y), "reprt_code": "11011"})
+        if j is None:
             continue
         for it in j.get("list", []):
             se = (it.get("se") or "").replace(" ", "")
@@ -212,10 +236,9 @@ KSIC = {
 
 
 def induty_code(corp):
-    j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": corp})
-    time.sleep(0.06)
-    if j.get("status") != "000":
-        raise ApiError(f"company.json {j.get('status')} {j.get('message')}")
+    j = dart("company.json", {"corp_code": corp})
+    if j is None:
+        return ""
     return (j.get("induty_code") or "").strip()
 
 
@@ -228,11 +251,8 @@ def sector_name(code):
 
 def interim_dps(corp, year, reprt):
     """분기·반기보고서의 당기 주당현금배당금(보통주). 보고서 없으면 None"""
-    j = get_json(f"{DART}/alotMatter.json", {
-        "crtfc_key": DART_KEY, "corp_code": corp,
-        "bsns_year": str(year), "reprt_code": reprt})
-    time.sleep(0.06)
-    if j.get("status") != "000":
+    j = dart("alotMatter.json", {"corp_code": corp, "bsns_year": str(year), "reprt_code": reprt})
+    if j is None:
         return None
     for it in j.get("list", []):
         se = (it.get("se") or "").replace(" ", "")
@@ -257,11 +277,9 @@ def pay_cycle(corp):
 def per_share(corp, year):
     """사업보고서 전체재무제표에서 기본주당이익(EPS)·지배주주지분 (연결 우선)"""
     for fs_div in ("CFS", "OFS"):
-        j = get_json(f"{DART}/fnlttSinglAcntAll.json", {
-            "crtfc_key": DART_KEY, "corp_code": corp, "bsns_year": str(year),
-            "reprt_code": "11011", "fs_div": fs_div})
-        time.sleep(0.06)
-        if j.get("status") != "000":
+        j = dart("fnlttSinglAcntAll.json", {"corp_code": corp, "bsns_year": str(year),
+                                            "reprt_code": "11011", "fs_div": fs_div})
+        if j is None:
             continue
         eps = eq_parent = None
         for it in j.get("list", []):
@@ -287,11 +305,9 @@ def financials(corps, year):
     raw = {}
     for i in range(0, len(corps), 100):
         chunk = corps[i:i + 100]
-        j = get_json(f"{DART}/fnlttMultiAcnt.json", {
-            "crtfc_key": DART_KEY, "corp_code": ",".join(chunk),
-            "bsns_year": str(year), "reprt_code": "11011"})
-        time.sleep(0.1)
-        if j.get("status") != "000":
+        j = dart("fnlttMultiAcnt.json", {"corp_code": ",".join(chunk),
+                                         "bsns_year": str(year), "reprt_code": "11011"}, pause=0.1)
+        if j is None:
             continue
         for it in j.get("list", []):
             d = raw.setdefault(it["corp_code"], {}).setdefault(it.get("fs_div"), {})
@@ -537,10 +553,15 @@ def main():
             errs.append(f"{cand} → {e}")
     else:
         raise SystemExit("시세 API(공공데이터포털) 호출 실패\n" + "\n".join(errs))
+    global DART_MAX_CALLS
     j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": "00126380"})
-    if j.get("status") != "000":
+    if j.get("status") == "020":
+        log("DART 오늘 호출 한도 초과 → 저장된 자료로만 결과를 만듦")
+        DART_MAX_CALLS = -1
+    elif j.get("status") != "000":
         raise SystemExit(f"DART 인증키 오류 → {j.get('status')} {j.get('message')}")
-    log("DART 점검 OK")
+    else:
+        log("DART 점검 OK")
 
     cur_day, cur = snapshot_on_or_before(TODAY)
     if not cur:
@@ -589,30 +610,54 @@ def main():
     # ── DART: 회사별 캐시, 오늘 차례인 회사만 새로 받음 ──
     corps = sorted({cmap[base_of[c]] for c in uni})
     cc = cache["corp"]
-    todo = [k for k in corps if due_today(k, cc.get(k))]
-    log(f"DART 대상 회사 {len(corps)} · 오늘 새로 받을 회사 {len(todo)}")
-    try:
-        fresh_fins, fins_ok = (financials(todo, LATEST_FY) if todo else {}), True
-    except Exception as e:  # noqa: BLE001
-        log("  재무 일괄조회 실패 → 배당 지급 회사는 다음 실행 때 다시 받음", e)
-        fresh_fins, fins_ok = {}, False
-    for i, corp in enumerate(todo, 1):
+    # 아직 한 번도 못 받은 회사 → 오래된 순으로 처리
+    todo = sorted((k for k in corps if due_today(k, cc.get(k))),
+                  key=lambda k: (k in cc, cc.get(k, {}).get("t", "")))
+    log(f"DART 대상 회사 {len(corps)} · 이번에 받을 회사 {len(todo)} (최대 {DART_MINUTES:.0f}분)")
+    t0, done, stop = time.time(), 0, ""
+    for i in range(0, len(todo), 50):
+        batch = todo[i:i + 50]
         try:
-            dby, payout = dividends(corp)
-            ent = {"t": TODAY.isoformat(), "div": dby, "pay": payout}
-            if (dby["보통"].get(LATEST_FY) or 0) > 0 or (dby["우선"].get(LATEST_FY) or 0) > 0:
-                if not fins_ok:
-                    raise ApiError("재무 자료 없음")
-                ent["cyc"] = pay_cycle(corp)
-                ent["ps"] = list(per_share(corp, LATEST_FY))
-                ent["ind"] = induty_code(corp)
-                ent["fs"] = fresh_fins.get(corp, {})
-            cc[corp] = ent  # 전부 성공했을 때만 저장
+            fresh_fins, fins_ok = financials(batch, LATEST_FY), True
+        except DartLimit:
+            stop = "DART 일일 호출 한도 도달"
+            break
         except Exception as e:  # noqa: BLE001
-            log("  DART 실패(다음 실행 때 재시도)", corp, e)
-        if i % 100 == 0:
-            log(f"  DART {i}/{len(todo)}")
-            save_cache(cache)  # 중간 저장
+            log("  재무 일괄조회 실패 → 배당 지급 회사는 다음 실행 때 다시 받음", e)
+            fresh_fins, fins_ok = {}, False
+        for corp in batch:
+            if (time.time() - t0) / 60 > DART_MINUTES:
+                stop = f"시간 상한 {DART_MINUTES:.0f}분 도달"
+                break
+            if DART_CALLS > DART_MAX_CALLS:
+                stop = f"이번 실행 호출 상한 {DART_MAX_CALLS}건 도달"
+                break
+            try:
+                dby, payout = dividends(corp)
+                ent = {"t": TODAY.isoformat(), "div": dby, "pay": payout}
+                if (dby["보통"].get(LATEST_FY) or 0) > 0 or (dby["우선"].get(LATEST_FY) or 0) > 0:
+                    if not fins_ok:
+                        raise ApiError("재무 자료 없음")
+                    ent["cyc"] = pay_cycle(corp)
+                    ent["ps"] = list(per_share(corp, LATEST_FY))
+                    ent["ind"] = induty_code(corp)
+                    ent["fs"] = fresh_fins.get(corp, {})
+                cc[corp] = ent  # 전부 성공했을 때만 저장
+                done += 1
+            except DartLimit:
+                stop = "DART 일일 호출 한도 도달"
+                break
+            except Exception as e:  # noqa: BLE001
+                log("  DART 실패(다음 실행 때 재시도)", corp, e)
+        save_cache(cache)  # 50개마다 저장
+        log(f"  DART {min(i + 50, len(todo))}/{len(todo)} · 호출 {DART_CALLS}건 · {(time.time() - t0) / 60:.0f}분")
+        if stop:
+            break
+    if stop:
+        log(f"DART 수집 중단: {stop} → 나머지 {len(todo) - done}개 회사는 다음 실행 때 이어서 받음")
+    missing = sum(1 for k in corps if k not in cc)
+    if missing:
+        log(f"※ 아직 자료가 없는 회사 {missing}개는 이번 결과에서 빠짐")
     save_cache(cache)
 
     def ent_of(c):
