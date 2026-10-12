@@ -274,30 +274,46 @@ def pay_cycle(corp):
     return 1
 
 
-def per_share(corp, year):
-    """사업보고서 전체재무제표에서 기본주당이익(EPS)·지배주주지분 (연결 우선)"""
-    for fs_div in ("CFS", "OFS"):
+def per_share(corp, year, prefer=("CFS", "OFS")):
+    """사업보고서 전체재무제표에서 기본주당이익(EPS)·지배주주지분 (연결 우선)
+    반환: (당기 EPS, 지배주주지분, {연도: EPS} 3년치, 사용한 재무제표 구분)"""
+    for fs_div in prefer:
         j = dart("fnlttSinglAcntAll.json", {"corp_code": corp, "bsns_year": str(year),
                                             "reprt_code": "11011", "fs_div": fs_div})
         if j is None:
             continue
         eps = eq_parent = None
+        hist = {}
         for it in j.get("list", []):
             aid = it.get("account_id") or ""
             nm = (it.get("account_nm") or "").replace(" ", "")
             v = num(it.get("thstrm_amount"))
+            if not hist and it.get("sj_div") in ("IS", "CIS") and (
+                    aid == "ifrs-full_BasicEarningsLossPerShare"
+                    or (nm.startswith("기본주당") and "계속" not in nm and "우선" not in nm)):
+                for off, key in ((0, "thstrm_amount"), (1, "frmtrm_amount"), (2, "bfefrmtrm_amount")):
+                    x = num(it.get(key))
+                    if x is not None:
+                        hist[year - off] = x
+                eps = hist.get(year)
             if v is None:
                 continue
-            if eps is None and it.get("sj_div") in ("IS", "CIS") and (
-                    aid == "ifrs-full_BasicEarningsLossPerShare"
-                    or (nm.startswith("기본주당") and "계속" not in nm)):
-                eps = v
             if eq_parent is None and it.get("sj_div") == "BS" and (
                     aid == "ifrs-full_EquityAttributableToOwnersOfParent"
                     or "지배기업" in nm and "소유주" in nm and "자본" in nm):
                 eq_parent = v
-        return eps, eq_parent
-    return None, None
+        return eps, eq_parent, hist, fs_div
+    return None, None, {}, None
+
+
+def eps_history(corp):
+    """최근 6년 EPS: 최신 사업보고서(3년치) + 3년 전 사업보고서(3년치). 같은 재무제표 구분 사용"""
+    eps, eq_parent, hist, fs_div = per_share(corp, LATEST_FY)
+    if fs_div:
+        _, _, older, _ = per_share(corp, LATEST_FY - 3, (fs_div,))
+        for y, v in older.items():
+            hist.setdefault(y, v)
+    return [eps, eq_parent], {str(y): hist[y] for y in sorted(hist)}
 
 
 def financials(corps, year):
@@ -356,6 +372,8 @@ def due_today(corp, entry):
     """오늘 새로 받을 차례인지: 회사코드로 30개 그룹을 나눠 하루 한 그룹씩, 35일 넘은 건 무조건"""
     if not entry:
         return True
+    if "cyc" in entry and "eh" not in entry:  # 예전 형식(EPS 이력 없음) → 새로 받기
+        return True
     try:
         age = (TODAY - dt.date.fromisoformat(entry.get("t", "2000-01-01"))).days
     except ValueError:
@@ -376,12 +394,21 @@ def fy_of(ym):
     return y - 1 if m >= 4 else y - 2
 
 
+def eps_cagr(eh, n):
+    """n년 EPS 연평균 성장률(%). 시작·끝 중 하나라도 0 이하면 계산 불가"""
+    eh = eh or {}
+    a, b = eh.get(LATEST_FY - n), eh.get(LATEST_FY)
+    if not a or not b or a <= 0 or b <= 0:
+        return None
+    return round(((b / a) ** (1 / n) - 1) * 100, 1)
+
+
 def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
 def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
-            common_shares=None, total_shares=None):
+            common_shares=None, total_shares=None, eh=None):
     price = num(row.get("clpr"))
     if not price or not (dps.get(LATEST_FY) or 0) > 0:
         return None
@@ -410,6 +437,7 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
                 i = 0 if f"{y}12" < seq[0][0] else len(seq) - 1
             return mult[i]
         dps = {y: v / mult_for_year(y) for y, v in dps.items()}
+        eh = {y: v / mult_for_year(y) for y, v in (eh or {}).items()}
 
     last = dps[LATEST_FY]
 
@@ -505,6 +533,30 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
 
     disc = clamp(((ratio_disc or 1) - 1) / 0.5) * 20 + clamp(-dd52 / 0.4) * 10
 
+    # 이익 성장 (20점): 회사가 돈을 더 벌면서 배당을 늘리는지
+    eh = eh or {}
+    eg5, eg3 = eps_cagr(eh, 5), eps_cagr(eh, 3)
+    n_eg, eg = (5, eg5) if eg5 is not None else (3, eg3)
+    dbase = dps.get(LATEST_FY - n_eg) or 0
+    dg = ((last / dbase) ** (1 / n_eg) - 1) * 100 if dbase > 0 else None  # 같은 기간 배당 성장률
+    earn = 0.0
+    eps_down = False
+    if eh:
+        e_new, e_old = eh.get(LATEST_FY), eh.get(LATEST_FY - n_eg)
+        if eg is not None:
+            earn += clamp(eg / 10) * 10                       # ① EPS 성장률
+            if dg is not None:
+                earn += 5 if eg >= dg else 2 if eg > 0 else 0  # ② 이익이 배당을 따라가는지
+        eps_down = (e_new is not None and e_old is not None and e_new < e_old
+                    and dg is not None and dg > 0)
+        ys = sorted(eh)
+        loss = any(eh[y] <= 0 for y in ys)
+        ups_e = sum(1 for a, b in zip(ys, ys[1:]) if eh[b] > eh[a])
+        earn += 0 if loss else 5 if ups_e >= 3 else 3          # ③ 이익 꾸준함
+
+    # 최종 100점: 안정성 25 · 배당 성장 30 · 이익 성장 20 · 가격 할인 25
+    safe, grow, disc = safe * 25 / 30, grow * 30 / 40, disc * 25 / 30
+
     return {
         "c": code, "n": row.get("itmsNm"), "m": row.get("mrktCtg"),
         "cap": round((num(row.get("mrktTotAmt")) or 0) / 1e8),
@@ -519,12 +571,15 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
         "curr": round(cur_ratio) if cur_ratio is not None else None,
         "fin": is_fin, "op": op_pos, "opn": len(op), "ni": ni_pos, "nin": len(ni),
         "split": split, "jump": jump,
+        "eh": {str(y): round(v) for y, v in sorted((eh or {}).items())},
+        "eg3": eg3, "eg5": eg5,
         "paid": paid, "paidp": paid_plus, "cyc": cyc,
         "g1": round(g1 * 100, 1) if g1 is not None else None,
         "eps": round(eps) if eps is not None else None,
         "per": round(per, 1) if per else None, "pbr": round(pbr, 2) if pbr else None,
-        "s": round(safe + grow + disc, 1),
-        "sp": [round(safe, 1), round(grow, 1), round(disc, 1)],
+        "s": round(safe + grow + earn + disc, 1),
+        "sp": [round(safe, 1), round(grow, 1), round(earn, 1), round(disc, 1)],
+        "edown": eps_down, "noeps": not eh,
         "yh": yh,
     }
 
@@ -639,7 +694,7 @@ def main():
                     if not fins_ok:
                         raise ApiError("재무 자료 없음")
                     ent["cyc"] = pay_cycle(corp)
-                    ent["ps"] = list(per_share(corp, LATEST_FY))
+                    ent["ps"], ent["eh"] = eps_history(corp)
                     ent["ind"] = induty_code(corp)
                     ent["fs"] = fresh_fins.get(corp, {})
                 cc[corp] = ent  # 전부 성공했을 때만 저장
@@ -685,7 +740,7 @@ def main():
         common_shares = num((cur.get(base_of[c]) or {}).get("lstgStCnt"))
         a = analyze(c, uni[c], hist[c], dps_of(c), intkeys(e["pay"]), e.get("fs", {}),
                     e.get("cyc", 1), tuple(e.get("ps") or (None, None)),
-                    common_shares, tot_shares.get(base_of[c]))
+                    common_shares, tot_shares.get(base_of[c]), intkeys(e.get("eh")))
         if a:
             a["ksic"] = e.get("ind", "")
             a["sec"] = sector_name(a["ksic"])
