@@ -25,6 +25,7 @@ import requests
 DART_KEY = os.environ.get("DART_API_KEY", "")
 PRICE_KEY = os.environ.get("DATA_GO_KR_KEY", "")
 MIN_CAP_EOK = float(os.environ.get("MIN_CAP_EOK", "2000"))
+MIN_CAP_PREF_EOK = float(os.environ.get("MIN_CAP_PREF_EOK", "1000"))  # 우선주 시총 하한
 MONTHS = 60  # 배당률 비교용 월말 주가 기간(5년)
 
 DART = "https://opendart.fss.or.kr/api"
@@ -149,8 +150,9 @@ def corp_codes():
 
 
 def dividends(corp):
-    """연도별 보통주 주당현금배당금(원), 현금배당성향(%)  — 사업보고서 3년치 × 4회 = 12년"""
-    dps, pay_c, pay_s = {}, {}, {}
+    """연도별 주당현금배당금(원) {'보통': {...}, '우선': {...}}, 현금배당성향(%)
+    — 사업보고서 3년치 × 4회 = 12년"""
+    dps_by, pay_c, pay_s = {"보통": {}, "우선": {}}, {}, {}
     for y in (LATEST_FY, LATEST_FY - 3, LATEST_FY - 6, LATEST_FY - 9):
         j = get_json(f"{DART}/alotMatter.json", {
             "crtfc_key": DART_KEY, "corp_code": corp,
@@ -164,8 +166,10 @@ def dividends(corp):
             for off, key in ((0, "thstrm"), (1, "frmtrm"), (2, "lwfr")):
                 yr = y - off
                 raw = it.get(key)
-                if "주당현금배당금" in se and ("보통" in kind or kind == ""):
-                    if yr not in dps and raw is not None:
+                if "주당현금배당금" in se:
+                    k = "우선" if "우선" in kind else "보통" if ("보통" in kind or kind == "") else None
+                    dps = dps_by.get(k)
+                    if dps is not None and yr not in dps and raw is not None:
                         v = num(raw)
                         dps[yr] = v if v is not None else 0.0  # '-' 는 무배당
                 elif "현금배당성향" in se:
@@ -174,7 +178,37 @@ def dividends(corp):
                     if yr not in tgt and v is not None:
                         tgt[yr] = v
     payout = {**pay_s, **pay_c}  # 연결 우선
-    return dps, payout
+    return dps_by, payout
+
+
+# 한국표준산업분류(KSIC) 앞자리 → 섹터 이름 (가장 긴 접두어 우선)
+KSIC = {
+    "10": "식품", "11": "음료·주류", "12": "담배", "13": "섬유", "14": "의류", "15": "신발·가죽",
+    "16": "목재", "17": "제지", "18": "인쇄", "19": "정유", "20": "화학", "204": "화장품·생활용품",
+    "21": "제약·바이오", "22": "고무·플라스틱", "23": "시멘트·유리", "24": "철강·금속",
+    "25": "금속가공", "26": "전자", "261": "반도체", "262": "전자부품", "263": "컴퓨터",
+    "264": "통신장비", "265": "가전·영상기기", "27": "의료·정밀기기", "28": "전기장비",
+    "282": "2차전지", "29": "기계", "30": "자동차", "303": "자동차부품", "31": "조선·운송장비",
+    "311": "조선", "313": "항공우주·방산", "32": "가구", "33": "기타제조", "35": "전력·가스",
+    "36": "수도", "38": "환경", "41": "건설", "42": "건설", "45": "자동차판매", "46": "도매·상사",
+    "47": "유통", "49": "육상운송", "50": "해운", "51": "항공", "52": "물류", "55": "숙박·레저",
+    "56": "외식", "58": "출판", "582": "소프트웨어", "59": "미디어·엔터", "60": "방송",
+    "61": "통신", "62": "IT서비스", "63": "인터넷·플랫폼", "64": "금융", "641": "은행",
+    "6499": "지주회사", "64992": "지주회사", "65": "보험", "66": "금융서비스", "6612": "증권",
+    "68": "부동산", "70": "연구개발", "71": "전문서비스", "72": "엔지니어링", "73": "광고",
+    "74": "사업지원", "75": "사업지원", "85": "교육", "86": "의료", "90": "문화·여가",
+    "91": "스포츠·레저",
+}
+
+
+def sector_of(corp):
+    j = get_json(f"{DART}/company.json", {"crtfc_key": DART_KEY, "corp_code": corp})
+    time.sleep(0.06)
+    code = (j.get("induty_code") or "").strip()
+    for n in range(len(code), 1, -1):
+        if code[:n] in KSIC:
+            return KSIC[code[:n]], code
+    return "기타", code
 
 
 def interim_dps(corp, year, reprt):
@@ -271,7 +305,8 @@ def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None)):
+def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None),
+            common_shares=None, total_shares=None):
     price = num(row.get("clpr"))
     last = dps.get(LATEST_FY)
     if not price or not last or last <= 0:
@@ -330,15 +365,17 @@ def analyze(code, row, hist, dps, payout, fs, cyc=1, ps=(None, None)):
     pay = payout.get(LATEST_FY)
 
     # EPS·PER·PBR (사업보고서 기준. 없으면 순이익·자본총계 / 상장주식수로 근사)
-    shares_now = num(row.get("lstgStCnt"))
+    # 우선주는 회사(보통주) EPS·BPS 를 그대로 사용, BPS 는 보통+우선 합산 주식수 기준
+    common_shares = common_shares or num(row.get("lstgStCnt"))
+    total_shares = total_shares or common_shares
     eps, eq_parent = ps
     ni0 = acct(fs, "당기순이익")[0]
-    if eps is None and shares_now and ni0 is not None:
-        eps = ni0 / shares_now
+    if eps is None and total_shares and ni0 is not None:
+        eps = ni0 / total_shares
     if eq_parent is None:
         eq_parent = eq
     per = price / eps if eps and eps > 0 else None
-    bps = eq_parent / shares_now if eq_parent and shares_now else None
+    bps = eq_parent / total_shares if eq_parent and total_shares else None
     pbr = price / bps if bps and bps > 0 else None
 
     # ── 점수 (100점) ──
@@ -422,16 +459,17 @@ def main():
     log("시세 기준일", cur_day, "종목", len(cur))
 
     cmap = corp_codes()
-    uni = {}
+    uni, base_of = {}, {}  # base_of: 종목코드 → 보통주 코드
     for code, r in cur.items():
-        if r.get("mrktCtg") not in ("KOSPI", "KOSDAQ"):
+        if r.get("mrktCtg") not in ("KOSPI", "KOSDAQ") or "스팩" in (r.get("itmsNm") or ""):
             continue
-        if not code.endswith("0") or "스팩" in (r.get("itmsNm") or ""):
-            continue  # 우선주·스팩 제외
-        if (num(r.get("mrktTotAmt")) or 0) < MIN_CAP_EOK * 1e8:
+        base = code if code.endswith("0") else code[:5] + "0"
+        if base not in cmap:
             continue
-        if code in cmap:
-            uni[code] = r
+        pref = base != code
+        if (num(r.get("mrktTotAmt")) or 0) < (MIN_CAP_PREF_EOK if pref else MIN_CAP_EOK) * 1e8:
+            continue
+        uni[code], base_of[code] = r, base
     log("분석 대상", len(uni))
 
     hist = {c: [] for c in uni}
@@ -445,34 +483,54 @@ def main():
                 hist[c].append((d.strftime("%Y%m"), num(r.get("clpr")), num(r.get("lstgStCnt"))))
     log("월말 주가 수집 완료")
 
+    corps = sorted({cmap[base_of[c]] for c in uni})
     divs = {}
-    for i, c in enumerate(uni, 1):
+    for i, corp in enumerate(corps, 1):
         try:
-            divs[c] = dividends(cmap[c])
+            divs[corp] = dividends(corp)
         except Exception as e:  # noqa: BLE001
-            log("  배당 실패", c, e)
+            log("  배당 실패", corp, e)
         if i % 100 == 0:
-            log(f"  배당 {i}/{len(uni)}")
+            log(f"  배당 {i}/{len(corps)}")
 
-    payers = [c for c in uni if divs.get(c) and (divs[c][0].get(LATEST_FY) or 0) > 0]
-    fins = financials([cmap[c] for c in payers], LATEST_FY)
-    log("배당 지급 종목", len(payers))
+    def dps_of(c):
+        d = divs.get(cmap[base_of[c]])
+        if not d:
+            return None
+        return d[0]["우선" if base_of[c] != c else "보통"]
+
+    payers = [c for c in uni if (dps_of(c) or {}).get(LATEST_FY, 0) > 0]
+    pay_corps = sorted({cmap[base_of[c]] for c in payers})
+    fins = financials(pay_corps, LATEST_FY)
+    log("배당 지급 종목", len(payers), "회사", len(pay_corps))
 
     extra = {}
-    for i, c in enumerate(payers, 1):
+    for i, corp in enumerate(pay_corps, 1):
         try:
-            extra[c] = (pay_cycle(cmap[c]), per_share(cmap[c], LATEST_FY))
+            extra[corp] = (pay_cycle(corp), per_share(corp, LATEST_FY), sector_of(corp))
         except Exception as e:  # noqa: BLE001
-            log("  주기·EPS 실패", c, e)
+            log("  주기·EPS·섹터 실패", corp, e)
         if i % 100 == 0:
-            log(f"  주기·EPS {i}/{len(payers)}")
+            log(f"  주기·EPS·섹터 {i}/{len(pay_corps)}")
+
+    # 보통주+우선주 합산 상장주식수 (BPS 계산용)
+    tot_shares = {}
+    for c, r in cur.items():
+        b = c if c.endswith("0") else c[:5] + "0"
+        if b in cmap:
+            tot_shares[b] = tot_shares.get(b, 0) + (num(r.get("lstgStCnt")) or 0)
 
     out = []
     for c in payers:
-        dps, payout = divs[c]
-        cyc, ps = extra.get(c, (1, (None, None)))
-        a = analyze(c, uni[c], hist[c], dps, payout, fins.get(cmap[c], {}), cyc, ps)
+        corp = cmap[base_of[c]]
+        payout = divs[corp][1]
+        cyc, ps, sec = extra.get(corp, (1, (None, None), ("기타", "")))
+        common_shares = num((cur.get(base_of[c]) or {}).get("lstgStCnt"))
+        a = analyze(c, uni[c], hist[c], dps_of(c), payout, fins.get(corp, {}), cyc, ps,
+                    common_shares, tot_shares.get(base_of[c]))
         if a:
+            a["sec"], a["ksic"] = sec
+            a["pref"] = base_of[c] != c
             out.append(a)
     out.sort(key=lambda x: -x["s"])
 
