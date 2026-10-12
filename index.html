@@ -136,7 +136,7 @@ svg text{fill:var(--sub);font-size:10px}
     <label>시장<select id="f_mkt">
       <option value="">전체</option><option value="KOSPI">코스피</option><option value="KOSDAQ">코스닥</option></select></label>
     <label class="chk"><input type="checkbox" id="f_profit">최근 3년 영업이익 흑자</label>
-    <label class="chk"><input type="checkbox" id="f_split" checked>분할·병합 의심 제외</label>
+    <label class="chk"><input type="checkbox" id="f_split">분할·병합 종목 제외</label>
     <div class="row2"><button id="reset">조건 모두 지우기</button><button id="close">닫기</button></div>
   </div>
 
@@ -148,7 +148,7 @@ svg text{fill:var(--sub);font-size:10px}
     배당·EPS·자본은 DART 사업보고서(연간, 보통주 기준), 시세는 금융위원회 주식시세정보 기준입니다.
     PER·PBR은 직전 사업연도 실적과 현재가로 계산합니다. 배당 지급기간은 조회 가능한 최대 12년까지 확인하며, 그 이상이면 '+'로 표시합니다.
     배당 주기는 분기·반기보고서의 배당 기록으로 판단합니다.
-    분할·병합·감자가 있었던 종목은 과거 배당과 주가가 왜곡될 수 있습니다. 투자 판단의 참고 자료일 뿐 매수 권유가 아닙니다.
+    최근 5년 내 분할·병합은 주식수 변화로 자동 보정하며, 그 이전 분할은 배당 감소처럼 보일 수 있습니다. 작년 배당이 직전 3년 평균의 1.8배를 넘으면 특별배당 가능성이 있어 할인 점수에서 그 증가분을 줄여 계산합니다. 투자 판단의 참고 자료일 뿐 매수 권유가 아닙니다.
   </div>
 </div>
 
@@ -187,8 +187,8 @@ $("#ranges").innerHTML = R.map(([k, nm, u, mn, mx]) => `
     ${mx ? `<input id="mx_${k}" inputmode="decimal" placeholder="최대">` : "<span></span>"}</div>`).join("");
 
 const store = {
-  get(){ try{ return JSON.parse(localStorage.getItem("divscan2")||"null"); }catch(e){ return null; } },
-  set(v){ try{ localStorage.setItem("divscan2", JSON.stringify(v)); }catch(e){} }
+  get(){ try{ return JSON.parse(localStorage.getItem("divscan3")||"null"); }catch(e){ return null; } },
+  set(v){ try{ localStorage.setItem("divscan3", JSON.stringify(v)); }catch(e){} }
 };
 const fmt = (v, d=1, suf="") => v==null ? "–" : (+v).toFixed(d) + suf;
 const won = v => v==null ? "–" : Math.round(v).toLocaleString("ko-KR");
@@ -203,7 +203,7 @@ function setState(o){
     const a = $("#mn_"+k), b = $("#mx_"+k); if (a) a.value = v[0]; if (b) b.value = v[1]; });
   $("#f_cyc").value = o.cyc || "0"; $("#f_mkt").value = o.mkt || "";
   $("#f_sec").value = o.sec || ""; $("#f_kind").value = o.kind || "";
-  $("#f_profit").checked = !!o.profit; $("#f_split").checked = o.split !== false;
+  $("#f_profit").checked = !!o.profit; $("#f_split").checked = !!o.split;
   $("#sort").value = o.sort || "s";
 }
 function getState(){
@@ -221,7 +221,8 @@ function applyPreset(p){
 }
 function warnings(s){
   const w = [];
-  if (s.split) w.push("분할·병합 의심");
+  if (s.split) w.push("분할·병합 보정됨");
+  if (s.jump) w.push("작년 배당 급증(특별배당?)");
   if (s.pay != null && s.pay > 80) w.push("배당성향 " + fmt(s.pay,0) + "%");
   if (s.opn && s.op < s.opn) w.push("영업적자 이력");
   if (s.nin && s.ni < s.nin) w.push("순손실 이력");
