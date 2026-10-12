@@ -87,6 +87,8 @@ svg text{fill:var(--sub);font-size:10px}
 .mx div{font-size:11.5px;color:var(--sub);line-height:1.3}
 .mx b{display:block;font-size:13.5px;color:var(--ink);font-weight:600}
 .neg{color:var(--warn)!important}
+.sec-chip{display:inline-block;font-size:11.5px;font-weight:500;padding:1px 7px;border-radius:6px;background:var(--acc-soft);color:var(--acc);margin-left:6px;vertical-align:2px}
+.pf-chip{background:var(--chip);color:var(--sub)}
 .gt{width:100%;border-collapse:collapse;font-size:13px}
 .gt th,.gt td{padding:5px 4px;text-align:right;border-bottom:1px solid var(--line)}
 .gt th{color:var(--sub);font-weight:500;font-size:12px}
@@ -128,6 +130,9 @@ svg text{fill:var(--sub);font-size:10px}
     <label>배당 주기<select id="f_cyc">
       <option value="0">전체</option><option value="1">연 1회만</option>
       <option value="2">반기 이상(연 2회+)</option><option value="4">분기(연 4회)</option></select></label>
+    <label>섹터<select id="f_sec"><option value="">전체</option></select></label>
+    <label>종류<select id="f_kind">
+      <option value="">보통주+우선주</option><option value="c">보통주만</option><option value="p">우선주만</option></select></label>
     <label>시장<select id="f_mkt">
       <option value="">전체</option><option value="KOSPI">코스피</option><option value="KOSDAQ">코스닥</option></select></label>
     <label class="chk"><input type="checkbox" id="f_profit">최근 3년 영업이익 흑자</label>
@@ -166,7 +171,7 @@ const R = [
   ["debt",  "부채비율(금융업 제외)", "%", 0, 1],
   ["cap",   "시가총액",          "억", 1, 0],
 ];
-const EXTRA = ["cyc","mkt"];
+const EXTRA = ["cyc","mkt","sec","kind"];
 const PRESETS = {
   best:   {y:[3,""], pay:["",80], nocut:[3,""], cagr:[0,""], ratio:[1.1,""], debt:["",150], profit:true, sort:"s"},
   growth: {paid:[10,""], nocut:[7,""], cagr:[5,""], pay:["",80], debt:["",200], profit:true, sort:"cagr"},
@@ -197,6 +202,7 @@ function setState(o){
   R.forEach(([k]) => { const v = o[k] || ["",""];
     const a = $("#mn_"+k), b = $("#mx_"+k); if (a) a.value = v[0]; if (b) b.value = v[1]; });
   $("#f_cyc").value = o.cyc || "0"; $("#f_mkt").value = o.mkt || "";
+  $("#f_sec").value = o.sec || ""; $("#f_kind").value = o.kind || "";
   $("#f_profit").checked = !!o.profit; $("#f_split").checked = o.split !== false;
   $("#sort").value = o.sort || "s";
 }
@@ -204,6 +210,7 @@ function getState(){
   const o = {};
   R.forEach(([k]) => { const a = inp("mn_"+k), b = inp("mx_"+k); if (a !== "" || b !== "") o[k] = [a, b]; });
   o.cyc = $("#f_cyc").value; o.mkt = $("#f_mkt").value;
+  o.sec = $("#f_sec").value; o.kind = $("#f_kind").value;
   o.profit = $("#f_profit").checked; o.split = $("#f_split").checked; o.sort = $("#sort").value;
   return o;
 }
@@ -237,16 +244,21 @@ function pass(s, o){
   if (c === 1 && s.cyc !== 1) return false;
   if (c >= 2 && s.cyc < c) return false;
   if (o.mkt && s.m !== o.mkt) return false;
+  if (o.sec && (s.sec || "기타") !== o.sec) return false;
+  if (o.kind === "c" && s.pref) return false;
+  if (o.kind === "p" && !s.pref) return false;
   if (o.profit && !(s.opn ? s.op === s.opn : s.ni === s.nin)) return false;
   if (o.split && s.split) return false;
   return true;
 }
 
+const secChips = s => `<span class="sec-chip" style="margin-left:0">${s.sec || "기타"}</span>` + (s.pref ? `<span class="sec-chip pf-chip">우선주</span>` : "");
 function card(s){
   const neg = v => v != null && v < 0 ? ' class="neg"' : "";
   const w = warnings(s);
   return `<div class="item" data-i="${DATA.stocks.indexOf(s)}">
-    <div class="top"><div class="nm">${s.n}<span class="cd">${s.c} · ${s.m==="KOSPI"?"코스피":"코스닥"}</span></div>
+    <div class="top"><div class="nm">${s.n}<span class="cd">${s.c} · ${s.m==="KOSPI"?"코스피":"코스닥"}</span>
+        <div>${secChips(s)}</div></div>
       <div class="sc">${fmt(s.s,0)}</div></div>
     <div class="big"><b>${fmt(s.y,2)}%</b>
       <span>5년 평균 ${fmt(s.avg,2,"%")}${s.ratio ? ` · <span class="up">${fmt(s.ratio,2)}배</span>` : ""} · ${won(s.p)}원</span></div>
@@ -273,7 +285,7 @@ function render(){
   const k = o.sort, asc = ["dd52","pay","per","pbr"].includes(k);
   rows = rows.filter(s => s[k] != null);
   rows.sort((a,b) => (asc ? a[k]-b[k] : b[k]-a[k]) || b.s - a.s);
-  const nFilters = Object.keys(o).filter(x => R.some(r => r[0] === x)).length + (+o.cyc ? 1 : 0) + (o.mkt ? 1 : 0) + (o.profit ? 1 : 0);
+  const nFilters = Object.keys(o).filter(x => R.some(r => r[0] === x)).length + (+o.cyc ? 1 : 0) + (o.mkt ? 1 : 0) + (o.profit ? 1 : 0) + (o.sec ? 1 : 0) + (o.kind ? 1 : 0);
   $("#ft").textContent = nFilters ? `조건 ${nFilters}` : "조건";
   $("#count").textContent = `${rows.length}개 종목` + (rows.length > 150 ? " · 상위 150개 표시" : "");
   $("#list").innerHTML = rows.slice(0,150).map(card).join("") ||
@@ -323,7 +335,8 @@ function openDetail(s){
   $("#panel").innerHTML = `
     <button class="close" aria-label="닫기">✕</button>
     <div class="nm" style="font-size:19px">${s.n}<span class="cd">${s.c}</span></div>
-    <div class="meta">${won(s.p)}원 · 시총 ${capTxt(s.cap)} · 종합 ${fmt(s.s,0)}점</div>
+    <div style="margin-top:4px">${secChips(s)}</div>
+    <div class="meta">${won(s.p)}원 · 시총 ${capTxt(s.cap)} · 종합 ${fmt(s.s,0)}점${s.pref ? " · 배당은 우선주 기준, EPS·PER·PBR은 회사 기준" : ""}</div>
     ${w.length ? `<div class="tags">${w.map(t=>`<span class="tag">${t}</span>`).join("")}</div>` : ""}
     <div class="sec"><h3>점수 구성</h3>
       ${m("안정성", s.sp[0], 30, "var(--bar1)")}${m("배당 성장", s.sp[1], 40, "var(--bar2)")}${m("가격 할인", s.sp[2], 30, "var(--bar3)")}</div>
@@ -364,6 +377,9 @@ $("#sheet").addEventListener("click", e => { if (e.target.id === "sheet" || e.ta
 
 fetch("data.json?t=" + Date.now()).then(r => { if (!r.ok) throw 0; return r.json(); }).then(d => {
   DATA = d;
+  const cnt = {}; d.stocks.forEach(x => { const k = x.sec || "기타"; cnt[k] = (cnt[k] || 0) + 1; });
+  $("#f_sec").insertAdjacentHTML("beforeend", Object.keys(cnt).sort((a,b) => cnt[b]-cnt[a] || a.localeCompare(b))
+    .map(k => `<option value="${k}">${k} (${cnt[k]})</option>`).join(""));
   $("#meta").textContent = `시세 ${d.priceDate} · 배당 ${d.fy}년 확정분 · 시총 ${capTxt(d.minCap)} 이상 · 갱신 ${d.updated}`;
   const saved = store.get();
   if (saved && saved.preset) applyPreset(saved.preset);
