@@ -73,7 +73,7 @@ h1{font-size:22px;margin:0;letter-spacing:-.3px}
 .meter span:first-child{width:62px;color:var(--sub)}
 .meter .tr{flex:1;height:8px;border-radius:5px;background:var(--chip);overflow:hidden}
 .meter .tr i{display:block;height:100%}
-.meter span:last-child{width:52px;text-align:right}
+.meter span:last-child{width:76px;text-align:right;white-space:nowrap}
 svg text{fill:var(--sub);font-size:10px}
 .links{display:flex;gap:8px;margin-top:16px}
 .links a{flex:1;text-align:center;text-decoration:none;color:var(--acc);border:1px solid var(--line);border-radius:10px;padding:9px;font-size:14px}
@@ -117,6 +117,7 @@ svg text{fill:var(--sub);font-size:10px}
       <option value="paid">배당 지급기간순</option>
       <option value="g1">1년 배당성장순</option>
       <option value="cagr">5년 배당성장순</option>
+      <option value="eg5">5년 EPS성장순</option>
       <option value="per">PER 낮은순</option>
       <option value="pbr">PBR 낮은순</option>
       <option value="eps">EPS 높은순</option>
@@ -144,7 +145,8 @@ svg text{fill:var(--sub);font-size:10px}
   <div class="list" id="list"></div>
 
   <div class="foot">
-    점수 = 재무 안정성 30 + 배당 성장 40 + 가격 할인 30.<br>
+    점수 = 재무 안정성 25 + 배당 성장 30 + 이익 성장 20 + 가격 할인 25.
+    이익 성장은 EPS 5년(없으면 3년) 성장률 10점, EPS가 배당만큼 늘었는지 5점, 6년간 적자 없이 꾸준한지 5점입니다.<br>
     배당·EPS·자본은 DART 사업보고서(연간, 보통주 기준), 시세는 금융위원회 주식시세정보 기준입니다.
     PER·PBR은 직전 사업연도 실적과 현재가로 계산합니다. 배당 지급기간은 조회 가능한 최대 12년까지 확인하며, 그 이상이면 '+'로 표시합니다.
     배당 주기는 분기·반기보고서의 배당 기록으로 판단합니다.
@@ -164,6 +166,7 @@ const R = [
   ["nocut", "연속 무삭감",       "년", 1, 0],
   ["g1",    "최근 1년 배당성장률", "%", 1, 1],
   ["cagr",  "5년 배당성장률(연)", "%", 1, 1],
+  ["eg5",   "5년 EPS성장률(연)", "%", 1, 1],
   ["ratio", "평소(5년 평균) 대비 배당률", "배", 1, 0],
   ["per",   "PER",              "배", 1, 1],
   ["pbr",   "PBR",              "배", 1, 1],
@@ -223,6 +226,8 @@ function warnings(s){
   const w = [];
   if (s.split) w.push("분할·병합 보정됨");
   if (s.jump) w.push("작년 배당 급증(특별배당?)");
+  if (s.edown) w.push("이익 감소 중 배당 증가");
+  if (s.noeps) w.push("EPS 자료 수집 중");
   if (s.pay != null && s.pay > 80) w.push("배당성향 " + fmt(s.pay,0) + "%");
   if (s.opn && s.op < s.opn) w.push("영업적자 이력");
   if (s.nin && s.ni < s.nin) w.push("순손실 이력");
@@ -304,6 +309,32 @@ function dpsChart(s){
       <text x="${x+bw*0.35}" y="${H+13}" text-anchor="middle">${String(y).slice(2)}</text>`;
   }).join("") + `</svg>`;
 }
+function epsChart(s){
+  const ys = Object.keys(s.eh || {}).sort(); if (ys.length < 2) return "";
+  const vs = ys.map(y => s.eh[y]);
+  const W = 600, H = 170, pad = 22, top = 16, bot = vs.some(v => v < 0) ? 34 : 20;
+  const mx = Math.max(...vs, 0), mn = Math.min(...vs, 0), rng = (mx - mn) || 1;
+  const Y = v => top + (mx - v) / rng * (H - top - bot), bw = (W - pad*2) / ys.length;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%"><line x1="${pad}" x2="${W-pad}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)"/>` +
+    ys.map((y,i) => { const v = vs[i], x = pad + i*bw + bw*0.15, y0 = Y(Math.max(v,0)), h = Math.abs(Y(v) - Y(0));
+      return `<rect x="${x}" y="${y0}" width="${bw*0.7}" height="${Math.max(h,1)}" rx="3" fill="${v < 0 ? "var(--warn)" : "var(--bar1)"}"/>
+        <text x="${x+bw*0.35}" y="${v < 0 ? Y(v)+11 : y0-4}" text-anchor="middle">${won(v)}</text>
+        <text x="${x+bw*0.35}" y="${H-4}" text-anchor="middle">${String(y).slice(2)}</text>`; }).join("") + `</svg>`;
+}
+function epsTable(s){
+  const ys = Object.keys(s.eh || {}).sort().reverse(); if (!ys.length) return `<div class="meta">EPS 이력이 없습니다.</div>`;
+  return `<table class="gt"><tr><th>연도</th><th>EPS</th><th>전년 대비</th></tr>` + ys.map(y => {
+    const v = s.eh[y], p = s.eh[String(+y-1)];
+    let g = "–", neg = false;
+    if (p != null) {
+      if (p > 0 && v > 0) { const r = (v/p - 1)*100; g = pct(r); neg = r < 0; }
+      else if (p <= 0 && v > 0) g = "흑자전환";
+      else if (p > 0 && v <= 0) { g = "적자전환"; neg = true; }
+      else { g = "적자지속"; neg = true; }
+    }
+    return `<tr><td>${y}</td><td${v<0?' class="neg"':""}>${won(v)}원</td><td${neg?' class="neg"':""}>${g}</td></tr>`;
+  }).join("") + `</table>`;
+}
 function growthTable(s){
   const ys = Object.keys(s.dps).sort().reverse();
   return `<table class="gt"><tr><th>연도</th><th>주당배당금</th><th>전년 대비</th></tr>` + ys.map((y,i) => {
@@ -340,7 +371,9 @@ function openDetail(s){
     <div class="meta">${won(s.p)}원 · 시총 ${capTxt(s.cap)} · 종합 ${fmt(s.s,0)}점${s.pref ? " · 배당은 우선주 기준, EPS·PER·PBR은 회사 기준" : ""}</div>
     ${w.length ? `<div class="tags">${w.map(t=>`<span class="tag">${t}</span>`).join("")}</div>` : ""}
     <div class="sec"><h3>점수 구성</h3>
-      ${m("안정성", s.sp[0], 30, "var(--bar1)")}${m("배당 성장", s.sp[1], 40, "var(--bar2)")}${m("가격 할인", s.sp[2], 30, "var(--bar3)")}</div>
+      ${s.sp.length > 3
+        ? m("안정성", s.sp[0], 25, "var(--bar1)") + m("배당 성장", s.sp[1], 30, "var(--bar2)") + m("이익 성장", s.sp[2], 20, "var(--acc)") + m("가격 할인", s.sp[3], 25, "var(--bar3)")
+        : m("안정성", s.sp[0], 30, "var(--bar1)") + m("배당 성장", s.sp[1], 40, "var(--bar2)") + m("가격 할인", s.sp[2], 30, "var(--bar3)")}</div>
     <div class="sec"><h3>배당</h3><div class="grid">
       ${kv("시가배당률", fmt(s.y,2,"%"))}${kv("배당성향", fmt(s.pay,0,"%"))}${kv("배당 주기", cycTxt(s.cyc))}
       ${kv("지급 기간", paidTxt(s))}${kv("연속 무삭감", s.nocut+"년")}${kv("10년 중 인상", s.ups+"회")}
@@ -349,6 +382,9 @@ function openDetail(s){
     <div class="sec"><h3>가치 지표 (${DATA.fy}년 실적 · 현재가)</h3><div class="grid">
       ${kv("PER", s.per==null ? (s.eps!=null&&s.eps<=0 ? "적자" : "–") : fmt(s.per,1)+"배")}
       ${kv("PBR", s.pbr==null ? "–" : fmt(s.pbr,2)+"배")}${kv("EPS", s.eps==null ? "–" : won(s.eps)+"원")}</div></div>
+    <div class="sec"><h3>EPS 추이 (원, 빨간색 = 적자)</h3>${epsChart(s)}
+      <div class="grid" style="margin:8px 0 10px">${kv("EPS 3년 성장(연)", pct(s.eg3))}${kv("EPS 5년 성장(연)", pct(s.eg5))}${kv("배당 5년 성장(연)", pct(s.cagr))}</div>
+      ${epsTable(s)}</div>
     <div class="sec"><h3>주당 배당금 추이 (원, 빨간색 = 감배)</h3>${dpsChart(s)}</div>
     <div class="sec"><h3>매년 배당 성장률</h3>${growthTable(s)}</div>
     <div class="sec"><h3>월말 배당률 추이 — 높을수록 주가가 싸진 것</h3>${yieldChart(s)}</div>
